@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccs-sessions"
+version = "0.1.0"
+description = "A TUI to find, browse, preview and resume Claude Code sessions across all your projects — a global claude -r."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Eric (ericosg)" }]
+keywords = ["claude", "claude-code", "tui", "textual", "sessions", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = [
+    # _fit_columns touches DataTable internals; cap the major until re-verified.
+    "textual>=8.0,<10",
+    "rich>=13",
+]
+
+[project.urls]
+Homepage = "https://github.com/ericosg/ccs"
+Repository = "https://github.com/ericosg/ccs"
+Issues = "https://github.com/ericosg/ccs/issues"
+
+[project.scripts]
+ccs = "ccs.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["ccs*"]

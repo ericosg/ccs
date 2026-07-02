@@ -1,0 +1,74 @@
+import asyncio
+import sys
+
+from ccs.tui import CCSApp
+
+
+async def main():
+    app = CCSApp()
+    async with app.run_test(size=(160, 40)) as pilot:
+        await pilot.pause(0.2)
+        table = app.query_one("#table")
+        base = table.row_count
+        print(f"mounted OK — table rows: {base}")
+        assert base > 0, "no rows populated"
+
+        # preview should render for the first row
+        await pilot.pause(0.4)
+        pv = app.query_one("#preview")
+        print(f"preview lines: {len(pv.lines)}  (id={app._preview_id})")
+        assert len(pv.lines) > 0, "preview empty"
+
+        # fuzzy filter (any common substring; just needs to narrow the list)
+        await pilot.press("slash")
+        for ch in "fix":
+            await pilot.press(ch)
+        await pilot.pause(0.1)
+        print(f"fuzzy 'fix' rows: {table.row_count}")
+        assert table.row_count <= base
+        await pilot.press("escape")
+        await pilot.pause(0.1)
+        print(f"after escape rows: {table.row_count}  mode={app.mode} fuzzy={app.fuzzy!r}")
+        # >= 1, not == base: the live re-index may add new sessions mid-test.
+        assert app.mode == "browse" and app.fuzzy == ""
+        assert table.row_count >= 1
+
+        # sort + group cycling shouldn't crash
+        await pilot.press("s")
+        await pilot.pause(0.05)
+        print(f"sort -> {app.sort}")
+        await pilot.press("g")
+        await pilot.pause(0.05)
+        print(f"group -> {app.group}  rows(with separators): {table.row_count}")
+        await pilot.press("g")
+        await pilot.press("g")
+        await pilot.pause(0.05)
+        print(f"group -> {app.group}")
+
+        # full-text search (any term; count not asserted, just exercises FTS)
+        await pilot.press("f")
+        for ch in "error":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        print(f"full-text 'error' rows: {table.row_count}  mode={app.mode}")
+
+        # toggle preview off/on
+        await pilot.press("escape")
+        await pilot.press("p")
+        await pilot.pause(0.05)
+        print(f"preview visible: {app._preview_visible}")
+        await pilot.press("p")
+        await pilot.pause(0.05)
+        print("all interactions OK")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+        print("\nPILOT TEST PASSED")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("\nPILOT TEST FAILED")
+        sys.exit(1)
