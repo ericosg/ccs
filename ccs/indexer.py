@@ -56,8 +56,14 @@ def _assistant_text(content) -> tuple[str, int]:
 
 
 def parse_session(session_id: str, path: Path, project_dir: str,
-                  drift: Optional[cf.Drift] = None) -> tuple[dict, list[dict]]:
-    """Parse one session file into (session_row, fts_messages)."""
+                  stat: Optional[os.stat_result] = None) -> tuple[dict, list[dict]]:
+    """Parse one session file into (session_row, fts_messages).
+
+    ``stat`` should be taken *before* parsing: lines appended mid-parse then
+    leave the stored mtime stale, so the next tick re-parses and catches them.
+    """
+    stat = stat or path.stat()
+    drift = cf.Drift()
     cwd = entrypoint = custom_title = ai_title = agent_name = recap = None
     last_prompt_line = first_prompt = last_branch = forked_from = None
     timestamps: list[str] = []
@@ -73,8 +79,7 @@ def parse_session(session_id: str, path: Path, project_dir: str,
     version = ""
 
     for obj in cf.iter_records(path):
-        if drift is not None:
-            drift.observe(obj)
+        drift.observe(obj)
         typ = obj.get("type")
         ts = obj.get("timestamp")
         if ts and isinstance(ts, str):
@@ -115,7 +120,7 @@ def parse_session(session_id: str, path: Path, project_dir: str,
             entry = cf.classify_user(obj)
             if entry.is_prompt:
                 turns += 1
-                if first_prompt is None:
+                if not first_prompt and entry.text:  # skip image-only prompts
                     first_prompt = entry.text[:500]
                 fts.append({"role": "user", "ts": ts, "text": entry.text[:_MAX_TEXT]})
         elif typ == "assistant":
@@ -161,7 +166,6 @@ def parse_session(session_id: str, path: Path, project_dir: str,
     if meta_text:
         fts.append({"role": "meta", "ts": last_ts, "text": meta_text[:_MAX_TEXT]})
 
-    stat = path.stat()
     project = os.path.basename(cwd.rstrip("/")) if cwd else project_dir
     row = {
         "id": session_id,
@@ -184,6 +188,7 @@ def parse_session(session_id: str, path: Path, project_dir: str,
         "agent_name": agent_name,
         "recap": recap,
         "cc_version": version or None,
+        "drift": drift.to_json(counts_only=True) if drift.unknown_count() else None,
         "first_prompt": first_prompt,
         "last_prompt": last_prompt,
         "entrypoint": entrypoint,
@@ -205,35 +210,36 @@ def index_all(
     """(Re)index sessions. Returns the list of session ids that changed.
 
     A parser upgrade (``ccformat.PARSER_VERSION``) forces a full re-parse.
-    Unknown format elements seen while parsing are accumulated in the
-    ``drift`` meta key (reset on every full pass).
     """
     full = not changed_only or db.get_meta(conn, "parser_version") != cf.PARSER_VERSION
     existing = {
         r["id"]: r["mtime"]
         for r in conn.execute("SELECT id, mtime FROM sessions").fetchall()
     }
-    files = list(iter_session_files(projects_dir))
-    seen: set[str] = set()
-    changed: list[str] = []
-    total = len(files)
-    drift = cf.Drift() if full else cf.Drift.from_json(db.get_meta(conn, "drift"))
-    drift_before = drift.to_json()
-
-    for i, (sid, path) in enumerate(files):
-        seen.add(sid)
-        if progress_cb and (i % 25 == 0 or i == total - 1):
-            progress_cb(i + 1, total)
+    # One file per session id: if the same id exists in two project dirs
+    # (copied/moved project), keep the newest — otherwise the two would
+    # overwrite each other's row and be re-parsed on every tick forever.
+    files: dict[str, tuple[Path, os.stat_result]] = {}
+    for sid, path in iter_session_files(projects_dir):
         try:
-            mtime = path.stat().st_mtime
+            st = path.stat()
         except OSError:
             continue
+        if sid not in files or st.st_mtime > files[sid][1].st_mtime:
+            files[sid] = (path, st)
+    changed: list[str] = []
+    total = len(files)
+
+    for i, (sid, (path, st)) in enumerate(files.items()):
+        if progress_cb and (i % 25 == 0 or i == total - 1):
+            progress_cb(i + 1, total)
+        mtime = st.st_mtime
         if not full and sid in existing and abs(existing[sid] - mtime) < 1e-6:
             continue
         if not full and _failed.get(str(path)) == mtime:
             continue
         try:
-            row, fts = parse_session(sid, path, path.parent.name, drift)
+            row, fts = parse_session(sid, path, path.parent.name, st)
         except Exception:
             _failed[str(path)] = mtime
             continue
@@ -243,13 +249,28 @@ def index_all(
         changed.append(sid)
 
     # Drop sessions whose files disappeared.
-    for sid in set(existing) - seen:
+    for sid in set(existing) - set(files):
         db.delete_session(conn, sid)
         changed.append(sid)
 
     if full:
         db.set_meta(conn, "parser_version", cf.PARSER_VERSION)
-    if drift.to_json() != drift_before:
-        db.set_meta(conn, "drift", drift.to_json())
     conn.commit()
     return changed
+
+
+def collect_drift(conn) -> cf.Drift:
+    """Aggregate unknown format elements over the *current* index.
+
+    Stored per session, so re-parsing a busy session doesn't inflate counts, a
+    deleted file takes its drift with it, and anything since added to the
+    ``KNOWN_*`` sets stops being reported without a re-parse.
+    """
+    total = cf.Drift()
+    for r in conn.execute("SELECT drift FROM sessions WHERE drift IS NOT NULL"):
+        total.merge(cf.Drift.from_json(r[0]))
+    for r in conn.execute("SELECT DISTINCT cc_version FROM sessions WHERE cc_version IS NOT NULL"):
+        if cf.version_key(r[0]) > cf.version_key(total.max_version):
+            total.max_version = r[0]
+    total.prune_known()
+    return total

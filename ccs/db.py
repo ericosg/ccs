@@ -14,7 +14,7 @@ DEFAULT_PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
 DEFAULT_DB_PATH = Path(os.path.expanduser("~/.claude/ccs.db"))
 
 # Bump on any schema change → connect() auto-drops & rebuilds the cache.
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_name    TEXT,               -- session name (agent-name line)
     recap         TEXT,               -- latest away_summary recap
     cc_version    TEXT,               -- newest Claude Code version seen
+    drift         TEXT,               -- JSON of unknown format elements (or NULL)
     first_prompt  TEXT,
     last_prompt   TEXT,
     entrypoint    TEXT,
@@ -65,7 +66,7 @@ SESSION_COLUMNS = [
     "id", "file_path", "project_dir", "cwd", "project", "first_ts", "last_ts",
     "duration_s", "turns", "assistant_turns", "tool_calls", "models",
     "git_branches", "branch", "forked_from", "custom_title", "ai_title",
-    "agent_name", "recap", "cc_version", "first_prompt", "last_prompt",
+    "agent_name", "recap", "cc_version", "drift", "first_prompt", "last_prompt",
     "entrypoint", "pr_links", "out_tokens", "size", "mtime",
 ]
 
@@ -73,7 +74,8 @@ SESSION_COLUMNS = [
 def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    # Generous busy timeout: the live index worker writes while the UI reads.
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")

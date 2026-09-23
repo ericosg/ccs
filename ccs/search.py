@@ -4,8 +4,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# \w is Unicode-aware: Greek, accented Latin, Cyrillic, CJK… all tokenize.
-_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+# Unicode letters/digits (Greek, accented Latin, Cyrillic, CJK…). "_" is a
+# separator, matching FTS5's unicode61 tokenizer — "\w" would keep it and
+# produce tokens the index can never contain.
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 STOPWORDS = {
     "the", "and", "for", "that", "this", "with", "from", "have", "was", "were",

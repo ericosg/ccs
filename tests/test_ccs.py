@@ -93,6 +93,10 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(self.kind("<some-future-tag>x</some-future-tag>"), "meta")
         self.assertEqual(self.kind("<pasted_content>my paste</pasted_content>"), "prompt")
         self.assertEqual(self.kind("<div>html question</div>"), "prompt")
+        # hyphenated tag at the start of a real prompt ≠ harness wrapper
+        self.assertEqual(self.kind("<my-button> doesn't render"), "prompt")
+        self.assertEqual(self.kind("<data-grid rows=3> fix this"), "prompt")
+        self.assertEqual(self.kind("<a-b>x</a-b>\n<c-d>y</c-d>"), "meta")
         self.assertEqual(self.kind("x", isMeta=True), "meta")
         self.assertEqual(self.kind("x", isCompactSummary=True), "compact")
         self.assertEqual(self.kind([{"type": "tool_result", "content": "r"}]), "tool_result")
@@ -122,9 +126,10 @@ class TestIndexer(FixtureMixin, unittest.TestCase):
         self.assertEqual(r["forked_from"], PARENT)
         self.assertEqual(r["project"], "proj")
         self.assertEqual(util.display_title(r), "Fix login bug")
-        drift = cf.Drift.from_json(db.get_meta(conn, "drift"))
-        self.assertIn("shiny-new-line-type", drift.line_types)
+        drift = indexer.collect_drift(conn)
+        self.assertEqual(drift.line_types, {"shiny-new-line-type": 1})
         self.assertIn("brand-new-wrapper", drift.wrapper_tags)
+        self.assertEqual(drift.max_version, "2.1.280")
         # incremental: nothing changed → nothing re-parsed
         self.assertEqual(indexer.index_all(conn, self.projects), [])
         # parser upgrade → full re-parse even though mtime is unchanged
@@ -134,6 +139,53 @@ class TestIndexer(FixtureMixin, unittest.TestCase):
         self.path.unlink()
         self.assertEqual(indexer.index_all(conn, self.projects), [SID])
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+
+    def test_drift_not_inflated_and_pruned(self):
+        conn = db.connect(self.db_path)
+        indexer.index_all(conn, self.projects)
+        for _ in range(3):  # a busy session re-parsed repeatedly
+            with self.path.open("a") as fh:
+                fh.write(json.dumps(_u("more", "2026-09-20T12:00:00Z")) + "\n")
+            os.utime(self.path, (time.time() + 5, time.time() + 5 + _))
+            indexer.index_all(conn, self.projects)
+        self.assertEqual(indexer.collect_drift(conn).line_types, {"shiny-new-line-type": 1})
+        with mock.patch.object(cf, "KNOWN_LINE_TYPES", cf.KNOWN_LINE_TYPES | {"shiny-new-line-type"}):
+            self.assertEqual(indexer.collect_drift(conn).line_types, {})  # no re-parse needed
+        self.path.unlink()
+        indexer.index_all(conn, self.projects)
+        self.assertEqual(indexer.collect_drift(conn).unknown_count(), 0)
+
+    def test_mtime_taken_before_parse(self):
+        conn = db.connect(self.db_path)
+        st = self.path.stat()
+        with self.path.open("a") as fh:  # lines land while we "parse"
+            fh.write(json.dumps(_u("late prompt", "2026-09-20T13:00:00Z")) + "\n")
+        os.utime(self.path, (st.st_atime, st.st_mtime + 3))
+        row, _ = indexer.parse_session(SID, self.path, "-tmp-proj", st)
+        self.assertEqual(row["mtime"], st.st_mtime)  # stale → next tick re-parses
+        db.upsert_session(conn, row)
+        conn.commit()
+        self.assertEqual(indexer.index_all(conn, self.projects), [SID])
+
+    def test_duplicate_session_id_settles(self):
+        conn = db.connect(self.db_path)
+        other = self.projects / "-tmp-other"
+        other.mkdir()
+        dup = other / f"{SID}.jsonl"
+        dup.write_text(self.path.read_text())
+        os.utime(dup, (time.time() + 60, time.time() + 60))  # newer copy wins
+        self.assertEqual(indexer.index_all(conn, self.projects), [SID])
+        self.assertEqual(indexer.index_all(conn, self.projects), [])  # not every tick
+        self.assertEqual(conn.execute("SELECT file_path FROM sessions").fetchone()[0], str(dup))
+
+    def test_image_only_first_prompt(self):
+        img = [{"type": "image", "source": {"type": "base64", "data": "x"}}]
+        self.path.write_text("\n".join(json.dumps(l) for l in [
+            _u(img, "2026-09-20T10:00:00Z"), _u("describe this", "2026-09-20T10:01:00Z")]))
+        row, _ = indexer.parse_session(SID, self.path, "-tmp-proj")
+        self.assertEqual(row["first_prompt"], "describe this")
+        self.assertEqual(row["turns"], 2)
+        self.assertIn("describe this", preview.plain_text(self.path).splitlines()[0])
 
     def test_text_search(self):
         conn = db.connect(self.db_path)
@@ -204,6 +256,8 @@ class TestUtil(unittest.TestCase):
         self.assertEqual(util.fmt_tokens(1500), "1.5k")
         self.assertEqual(util.short_model("claude-opus-5-5,claude-haiku-4-5"), "opus5.5+")
         self.assertEqual(search.tokens("The UI db ΔΟΚΙΜΗ"), ["ui", "db", "δοκιμη"])
+        # "_" separates, like FTS5's unicode61 tokenizer
+        self.assertEqual(search.tokens("___ stripe_webhook"), ["stripe", "webhook"])
 
 
 if __name__ == "__main__":

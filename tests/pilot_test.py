@@ -22,6 +22,18 @@ async def main():
         assert len(pv.lines) > 0, "preview empty"
         assert pv.virtual_size.width <= pv.size.width + 1, "preview wider than its pane"
 
+        # a live table rebuild must not move the cursor or yank the preview
+        for _ in range(4):
+            await pilot.press("down")
+        await pilot.pause(0.5)
+        sid = app._cursor_id
+        pv.scroll_to(y=0, animate=False)
+        await pilot.pause(0.1)
+        app.rebuild_table(keep_viewport=True)
+        await pilot.pause(0.5)
+        print(f"after live rebuild: same row={app._cursor_id == sid} preview y={pv.scroll_y}")
+        assert app._cursor_id == sid and pv.scroll_y == 0, "live rebuild disturbed the view"
+
         # fuzzy filter (any common substring; just needs to narrow the list)
         await pilot.press("slash")
         for ch in "fix":
@@ -55,6 +67,9 @@ async def main():
         await pilot.press("enter")
         await pilot.pause(0.3)
         print(f"full-text 'error' rows: {table.row_count}  mode={app.mode}")
+        mw = [c.width for c in table.ordered_columns if c.key.value == "match"][0]
+        assert mw >= 20, f"match column too narrow ({mw})"
+        assert table.virtual_size.width <= table.size.width, "table scrolls sideways"
 
         # AI search runs in a worker thread (own sqlite conn); claude is mocked.
         await pilot.press("escape")
@@ -85,6 +100,15 @@ async def main():
         print(f"preview visible: {app._preview_visible}")
         await pilot.press("p")
         await pilot.pause(0.05)
+        # terminal resize: table re-fits and the preview reflows to the new width
+        await pilot.resize_terminal(220, 40)
+        await pilot.pause(1.0)
+        pv = app.query_one("#preview")
+        widest = max((l.cell_length for l in pv.lines), default=0)
+        print(f"after resize: table {table.size.width} virt {table.virtual_size.width} "
+              f"preview {pv.size.width} widest line {widest}")
+        assert table.size.width > 96 and table.virtual_size.width <= table.size.width
+        assert pv.size.width - 12 <= widest <= pv.size.width, "preview didn't reflow"
         print("all interactions OK")
 
 

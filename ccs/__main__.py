@@ -34,7 +34,7 @@ def cmd_index(args) -> int:
 
 
 def _drift_hint(conn) -> None:
-    d = ccformat.Drift.from_json(db.get_meta(conn, "drift"))
+    d = indexer.collect_drift(conn)
     if d.unknown_count() or d.newer_than_verified():
         print("⚠ transcripts contain format elements ccs doesn't know yet — run `ccs doctor`")
 

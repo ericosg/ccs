@@ -31,7 +31,8 @@ PYTHONPATH=. .venv/bin/python tests/pilot_test.py   # headless Textual smoke tes
 There is **no build step and no lint/type config** — it's a small pure-Python
 package. The only runtime dependency is `textual` (which brings `rich`).
 Requires Python 3.9+. Developed against `textual` 8.x; `_fit_columns` touches a
-DataTable internal (`_require_update_dimensions`), so re-verify on major Textual
+DataTable internals (`_update_count` — a render-cache key — and
+`_require_update_dimensions`), so re-verify on major Textual
 bumps (see `pyproject.toml`'s version cap).
 
 ## Design principles
@@ -58,10 +59,16 @@ to notice and survive that:
   re-parse the format anywhere else.
 - **Graceful degradation**: unknown tools/MCP tools render via a generic
   first-useful-arg fallback; unknown blocks with a `text` field are shown as
-  text; any leading *hyphenated* `<some-tag>` in user text is treated as
-  harness noise (Claude Code's wrappers are all kebab-case), except `HUMAN_TAGS`.
-- **Drift detection**: while indexing, `ccformat.Drift` records every element
-  not in the `KNOWN_*` sets (stored in `meta.drift`, reset on each full pass).
+  text; an unknown kebab-case `<some-tag>…</some-tag>` is treated as harness
+  noise only when closed tag elements make up the **whole** user text (how
+  Claude Code wraps injected text) — so a prompt like `<my-button> doesn't
+  render` stays a prompt. `HUMAN_TAGS` are never wrappers.
+- **Drift detection**: while parsing, `ccformat.Drift` records every element
+  not in the `KNOWN_*` sets, stored **per session** (`sessions.drift` JSON).
+  `indexer.collect_drift(conn)` aggregates over the current index and prunes
+  names that are known *now* — so re-parsing a busy session doesn't inflate
+  counts, a deleted file takes its drift with it, and adding a name to a
+  `KNOWN_*` set clears the warning without a re-parse.
   The TUI status bar shows `⚠ Claude Code format changed — run ccs doctor`;
   `ccs doctor` rescans everything and lists each unknown with a count + an
   example file, checks the `claude` CLI version/flags and the live registry.
@@ -184,7 +191,7 @@ tests/pilot_test.py   headless Textual pilot smoke test (real ~/.claude data).
 - `sessions` — one row per session, all the metadata above, PK = session id.
 - `messages_fts` — FTS5 virtual table (`porter unicode61`), cols
   `session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, text`.
-- `meta` — key/value scratch: `schema_version`, `parser_version`, `drift` (JSON).
+- `meta` — key/value scratch: `schema_version`, `parser_version`.
 - **Schema versioning**: `db.SCHEMA_VERSION` — `connect()` drops & recreates all
   tables when it differs (the cache is disposable). **Bump it on any schema
   change** instead of writing migrations; the next index rebuilds in seconds.
@@ -193,12 +200,17 @@ tests/pilot_test.py   headless Textual pilot smoke test (real ~/.claude data).
   full pass over a few hundred sessions takes a few seconds; incremental is
   instant (~4 ms idle tick). `connect()` does no writes when the schema matches.
   A file that fails to parse is remembered by mtime and not retried until it changes.
+  The file is `stat`ed **before** parsing (lines appended mid-parse leave the
+  stored mtime stale → re-parsed next tick, never lost). If one session id
+  exists in two project dirs, only the newest file is indexed.
+  `connect()` uses a 30 s busy timeout (UI reads while the worker writes).
 
 ### Search modes
 
 - **Fuzzy** (`/`): in-memory substring over titles/project/cwd/prompts/branch;
   space-separated words are AND-ed. Live-filters on every keystroke.
-- **Full-text** (`f`): `search.text_search` — Unicode `\w+` tokens (≥2 chars;
+- **Full-text** (`f`): `search.text_search` — Unicode `[^\W_]+` tokens (`_`
+  separates, like FTS5's unicode61; ≥2 chars;
   Greek etc. work; stopwords dropped only if something remains), each quoted
   for FTS5. Ranks **sessions**: those containing *all* words (anywhere in the
   session) win; if none, falls back to *any* word. Score = best message bm25
@@ -218,6 +230,9 @@ tests/pilot_test.py   headless Textual pilot smoke test (real ~/.claude data).
     --model …`. Never dumps the full corpus into a prompt.
   - The TUI runs it in a thread worker that opens **its own** sqlite connection
     (sqlite objects are per-thread — using `self.conn` there raised every time).
+    Cancelled thread workers keep running and still call back, so results are
+    applied only if their `_search_gen` is current (bumped on every submit and
+    on Esc); `_last_query` is set when results arrive.
 
 ### `claude -p` JSON envelope (for reference)
 
@@ -255,8 +270,13 @@ nothing is available — never crashes.
 ### Live refresh
 
 `CCSApp.on_mount` runs one `reindex()` then `set_interval(2.0, self.reindex)`.
-`reindex` is a **`@work(thread=True, exclusive=True, group="index")`** worker
-(and a 30 s `_refresh_times` interval keeps the relative "when" cells current).
+`reindex()` starts the `_reindex_worker` thread **only if no pass is running**
+(`_indexing`; a full `R` request meanwhile is queued in `_full_pending`).
+Don't rely on `exclusive=True` for this: it only *cancels* the old worker, and a
+cancelled thread keeps running — slow passes then pile up every tick and fight
+over the DB lock. All thread workers use `exit_on_error=False` and report
+errors via `notify` (a worker exception would otherwise quit the app).
+A 30 s `_refresh_times` interval keeps the relative "when" cells current.
 Each tick it (a) incrementally re-indexes changed files and (b) computes
 `live.open_sessions()`, then `call_from_thread`s `_after_reindex(changed,
 open_status, drift)`. That reloads `all_sessions` when content changed, re-applies
@@ -269,6 +289,13 @@ worker opens its **own** connection each run and closes it — never share one
 sqlite connection across threads. WAL lets reader and writer coexist.
 
 ### Preview
+
+**Stale highlight events:** `DataTable` posts `RowHighlighted` for row 0 as soon
+as a rebuild adds the first row, delivered *after* the cursor has moved to its
+real target. `on_data_table_row_highlighted` therefore ignores any event whose
+row isn't the one under the cursor now (`_key_at_cursor`). Don't "fix" this with
+`prevent()`: its stack is a task-wide contextvar inherited by messages posted
+inside the block, and it suppressed later genuine highlights too.
 
 `on_data_table_row_highlighted` → 120 ms debounce (`set_timer`) →
 `@work(thread=True, exclusive=True, group="preview")` renders
@@ -298,8 +325,12 @@ title cell). Note the DataTable column *key* for the "branch" label is `fork`.
 compute widths from `table.size.width`: every non-title column is fixed
 (`_FIXED_COL_WIDTHS`), `match` is up to 40 in text/AI search (shrinks first on narrow terminals;
 its header label is blanked) and **0 while browsing**,
-and **title takes the remaining space** (min 24). Set `col.width`, then
-`table._require_update_dimensions = True; table.refresh()`. Re-run on `on_resize`,
+and **title takes the remaining space** (min 24). Set `col.width` (columns must be
+fixed-width — an auto-width column ignores `width`), then bump
+`table._update_count` (else the cached old layout keeps drawing), set
+`_require_update_dimensions`, `check_idle()`, `refresh()`. Re-run on the **table's own** `on_resize` (the App-level Resize fires before
+children are re-laid out, so widths would be stale; and never name an App
+attribute `_resize_timer` — Textual uses it),
 `on_mount` (via `call_after_refresh`), preview toggle, and search enter/clear. So
 title fills the view and grows further when the preview pane is hidden. **Keep
 `_FIXED_COL_WIDTHS` in sync with `add_column`.**

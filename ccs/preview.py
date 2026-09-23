@@ -203,7 +203,7 @@ def _highlight(t: Text, words: Iterable[str]) -> Text:
 def _header(tr: Transcript, fork_note: Optional[str]) -> RenderableType:
     title = tr.title or tr.ai_title
     if not title:
-        first = next((b for b in tr.blocks if b.kind == "you"), None)
+        first = next((b for b in tr.blocks if b.kind == "you" and b.text), None)
         title = " ".join(first.text.split())[:120] if first else "(untitled session)"
     out: list[RenderableType] = [Text(title, style="bold")]
 

@@ -87,6 +87,18 @@ class SessionTable(DataTable):
     def action_resume_row(self) -> None:
         self.app.action_resume()
 
+    def on_resize(self, event) -> None:
+        # Widget-level: fires after layout, so the new width is known (the
+        # App-level Resize arrives before children are re-laid out).
+        self.app._fit_columns()
+
+
+class PreviewLog(RichLog):
+    """RichLog pre-renders at a fixed width → re-render on resize to reflow."""
+
+    def on_resize(self, event) -> None:
+        self.app._on_preview_resize()
+
 
 class CCSApp(App):
     TITLE = "ccs"
@@ -139,13 +151,17 @@ class CCSApp(App):
         self._preview_id: str | None = None
         self._preview_timer = None
         self._preview_visible = True
-        self._resize_timer = None
+        self._preview_resize_timer = None
         self._resume_armed: tuple[str, float] | None = None
         self._open_status: dict[str, str] = {}   # session id -> busy|waiting|idle|open
         self._project_colors: dict[str, str] = {}   # project -> hex color
         self._titles_by_id: dict[str, str] = {}     # session id -> title (for fork parent)
         self._drift = ccformat.Drift()
         self._shown_count = 0
+        self._search_gen = 0           # bumps on every search/clear (stale AI guard)
+        self._indexing = False         # an index pass is running
+        self._full_pending = False     # a full pass was requested meanwhile
+        self._last_index_error: str | None = None
 
     # ---- layout -------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -156,8 +172,8 @@ class CCSApp(App):
                 yield SessionTable(id="table", cursor_type="row", zebra_stripes=True)
             with Vertical(id="right"):
                 # min_width default (78) is wider than the pane → clipped text.
-                yield RichLog(id="preview", wrap=True, markup=False,
-                              highlight=False, min_width=20)
+                yield PreviewLog(id="preview", wrap=True, markup=False,
+                                 highlight=False, min_width=20)
         yield Static("", id="status")
         yield Footer()
 
@@ -170,9 +186,9 @@ class CCSApp(App):
         table.add_column("when", key="when", width=6)
         table.add_column("turns", key="turns", width=5)
         table.add_column("model", key="model", width=8)
-        table.add_column("", key="match")
+        table.add_column("", key="match", width=0)  # fixed, not auto: snippets would widen it
         table.focus()
-        self._drift = ccformat.Drift.from_json(db.get_meta(self.conn, "drift"))
+        self._drift = indexer.collect_drift(self.conn)
         self.load_all()
         self.rebuild_table()
         self.call_after_refresh(self._fit_columns)
@@ -226,6 +242,26 @@ class CCSApp(App):
         prev_id = self._cursor_id if keep_cursor else None
         rows = self._display_rows()
         scroll_y = table.scroll_y
+        self._fill_table(table, rows, prev_id, scroll_y, keep_viewport)
+        self._update_status(len(rows))
+        # The cursor may have landed on a different session (filter changed);
+        # the highlight handler would catch it too, this is just immediate.
+        key = self._key_at_cursor(table)
+        if key and key != self._cursor_id:
+            self._cursor_id = key
+            self._schedule_preview(key)
+
+    def _key_at_cursor(self, table: DataTable) -> str | None:
+        if not table.row_count:
+            return None
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+        return None if not key or str(key).startswith(SEP_PREFIX) else key
+
+    def _fill_table(self, table: DataTable, rows: list[dict], prev_id: str | None,
+                    scroll_y: float, keep_viewport: bool) -> None:
         table.clear()
 
         show_match = self.mode in ("text", "ai")
@@ -266,7 +302,6 @@ class CCSApp(App):
                 target_row_index = idx
             idx += 1
 
-        self._update_status(len(rows))
         if idx:
             row = target_row_index if target_row_index is not None else self._first_session_row()
             if row is not None:
@@ -304,7 +339,7 @@ class CCSApp(App):
                          "turns": 5, "model": 8}
 
     def _fit_columns(self) -> None:
-        """Grow `title` to fill the current view; keep `match` short (search only)."""
+        """Grow `title` to fill the view; give `match` room in search modes."""
         try:
             table = self.query_one("#table", DataTable)
         except Exception:
@@ -316,32 +351,48 @@ class CCSApp(App):
         n_cols = len(self._FIXED_COL_WIDTHS) + 2  # + title + match
         fixed = sum(self._FIXED_COL_WIDTHS.values()) + pad * n_cols + 2
         free = avail - fixed
-        # Title keeps >= 24; in search modes `match` takes up to 40 of the rest
-        # (and shrinks first on narrow terminals, so nothing scrolls sideways).
-        match_w = max(0, min(40, free - 24)) if self.mode in ("text", "ai") else 0
-        title_w = max(24, free - match_w)
+        widths: dict[str, int] = {"match": 0}
+        if self.mode in ("text", "ai"):
+            # Search results need room for the snippet/reason: title may shrink
+            # to 20, and on tight layouts the branch column gives up its space.
+            fork_w = self._FIXED_COL_WIDTHS["fork"]
+            if free < 20 + 40:
+                free += fork_w
+                fork_w = 0
+            widths["fork"] = fork_w
+            widths["match"] = max(0, min(40, free - 20))
+            widths["title"] = max(20, free - widths["match"])
+        else:
+            fork_w = self._FIXED_COL_WIDTHS["fork"]
+            if free < 24:  # narrow terminal: drop branch before scrolling sideways
+                free += fork_w
+                fork_w = 0
+            widths["fork"] = fork_w
+            widths["title"] = max(24, free)
+        labels = {"match": "match", "fork": "branch"}
         changed = False
         for col in table.ordered_columns:
             kv = col.key.value
-            if kv == "title" and col.width != title_w:
-                col.width = title_w
-                changed = True
-            elif kv == "match" and col.width != match_w:
-                col.width = match_w
-                col.label = Text("match" if match_w else "")
+            if kv in widths and col.width != widths[kv]:
+                col.width = widths[kv]
+                if kv in labels:
+                    col.label = Text(labels[kv] if widths[kv] else "")
                 changed = True
         if changed:
+            # DataTable internals (as add_column does): _update_count is part of
+            # its render-cache keys, so bump it or the old layout keeps drawing.
+            table._update_count += 1
             table._require_update_dimensions = True
+            table.check_idle()
             table.refresh()
 
-    def on_resize(self, event) -> None:
-        self._fit_columns()
-        # The preview is pre-rendered at a fixed width → re-render to reflow.
-        if self._resize_timer is not None:
-            self._resize_timer.stop()
+    def _on_preview_resize(self) -> None:
+        if self._preview_resize_timer is not None:
+            self._preview_resize_timer.stop()
         if self._preview_id:
             sid = self._preview_id
-            self._resize_timer = self.set_timer(0.3, lambda: self._render_preview(sid, keep_scroll=True))
+            self._preview_resize_timer = self.set_timer(
+                0.3, lambda: self._render_preview(sid, keep_scroll=True))
 
     def _group_value(self, r: dict) -> str | None:
         if self.group == "project":
@@ -371,8 +422,15 @@ class CCSApp(App):
         key = event.row_key.value if event.row_key else None
         if not key or str(key).startswith(SEP_PREFIX):
             return
-        if key != self._cursor_id:
-            self._resume_armed = None
+        # Stale events: DataTable posts RowHighlighted for row 0 as soon as a
+        # rebuild adds the first row, delivered after the cursor has already
+        # moved to its real target. Acting on it would clobber _cursor_id and
+        # re-render the preview scrolled to the end — so only trust events
+        # that match where the cursor actually is now.
+        if key != self._key_at_cursor(event.data_table):
+            return
+        if key == self._cursor_id and key == self._preview_id:
+            return  # already showing it
         self._cursor_id = key
         self._schedule_preview(key)
 
@@ -396,10 +454,14 @@ class CCSApp(App):
         words = search.tokens(self._last_query) if self.mode == "text" else []
         self._do_render(sid, row.get("file_path"), fork_note, words, keep_scroll)
 
-    @work(thread=True, exclusive=True, group="preview")
+    @work(thread=True, exclusive=True, group="preview", exit_on_error=False)
     def _do_render(self, sid: str, file_path: str, fork_note: str | None,
                    words: list[str], keep_scroll: bool) -> None:
-        renderable = preview.render_session(file_path, fork_note=fork_note, highlight=words)
+        try:
+            renderable = preview.render_session(file_path, fork_note=fork_note,
+                                                highlight=words)
+        except Exception as e:  # a format surprise must not kill the app
+            renderable = Text(f"(could not render this session: {e!r})", style="red")
         self.call_from_thread(self._show_preview, sid, renderable, keep_scroll)
 
     def _show_preview(self, sid: str, renderable, keep_scroll: bool) -> None:
@@ -428,6 +490,13 @@ class CCSApp(App):
         self._input_kind = kind
         if kind == "fuzzy":
             self.mode = "fuzzy"
+            self.rebuild_table()
+            self.call_after_refresh(self._fit_columns)
+        elif self.mode == "fuzzy":
+            # Don't leave an invisible fuzzy filter applied under the new prompt.
+            self.mode = "browse"
+            self.fuzzy = ""
+            self.rebuild_table()
         inp = self.query_one("#search", Input)
         inp.add_class("visible")
         placeholders = {
@@ -444,6 +513,7 @@ class CCSApp(App):
         inp.value = ""
         inp.remove_class("visible")
         self._input_kind = None
+        self._search_gen += 1          # drop any AI search still in flight
         was_search = self.mode != "browse"
         self.mode = "browse"
         self.fuzzy = ""
@@ -468,11 +538,11 @@ class CCSApp(App):
             return
         if not query:
             return
-        self._last_query = query
+        self._search_gen += 1          # newest search wins
         if self._input_kind == "text":
             self.run_text_search(query)
         elif self._input_kind == "ai":
-            self.run_ai_search(query)
+            self.run_ai_search(query, self._search_gen)
         self.query_one("#table", DataTable).focus()
 
     def _show_results(self, mode: str, ids: list[str]) -> None:
@@ -488,6 +558,7 @@ class CCSApp(App):
         except Exception as e:
             self.notify(f"search error: {e}", severity="error")
             return
+        self._last_query = query
         hits = [h for h in hits if h.id in self._by_id]
         self.reasons = {h.id: h.snippet for h in hits}
         self._show_results("text", [h.id for h in hits])
@@ -498,8 +569,8 @@ class CCSApp(App):
         else:
             self.notify(f"{len(hits)} sessions matched")
 
-    @work(thread=True, exclusive=True, group="aisearch")
-    def run_ai_search(self, query: str) -> None:
+    @work(thread=True, exclusive=True, group="aisearch", exit_on_error=False)
+    def run_ai_search(self, query: str, gen: int) -> None:
         self.call_from_thread(self.notify, "asking Claude…", timeout=30)
         # sqlite connections are per-thread: this worker needs its own.
         conn = db.connect(self.db_path)
@@ -513,9 +584,12 @@ class CCSApp(App):
             return
         finally:
             conn.close()
-        self.call_from_thread(self._apply_ai_results, matches)
+        self.call_from_thread(self._apply_ai_results, matches, query, gen)
 
-    def _apply_ai_results(self, matches) -> None:
+    def _apply_ai_results(self, matches, query: str, gen: int) -> None:
+        if gen != self._search_gen:
+            return  # superseded by a newer search or cleared with Esc
+        self._last_query = query
         self.reasons = {}
         ids = []
         for m in matches:
@@ -577,28 +651,57 @@ class CCSApp(App):
                 input("press Enter to return to ccs…")
         self.reindex()
 
-    @work(thread=True, exclusive=True, group="index")
     def reindex(self, full: bool = False) -> None:
-        conn = db.connect(self.db_path)
+        """Start an index pass unless one is still running.
+
+        `exclusive` workers are only *cancelled*, and a cancelled thread keeps
+        running — so without this guard, slow passes (a full re-parse takes
+        ~15 s) would pile up every 2 s tick and fight over the DB lock.
+        """
+        if self._indexing:
+            self._full_pending |= full
+            return
+        self._indexing = True
+        self._reindex_worker(full)
+
+    @work(thread=True, group="index", exit_on_error=False)
+    def _reindex_worker(self, full: bool) -> None:
         try:
-            changed = indexer.index_all(conn, self.projects_dir, changed_only=not full)
-            open_status = live.open_sessions(conn)
-            drift = db.get_meta(conn, "drift")
-        finally:
-            conn.close()
+            conn = db.connect(self.db_path)
+            try:
+                changed = indexer.index_all(conn, self.projects_dir, changed_only=not full)
+                open_status = live.open_sessions(conn)
+                drift = indexer.collect_drift(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            self.call_from_thread(self._index_failed, e)
+            return
         # Always call back: open sessions can appear/disappear (or change
         # status) without any transcript on disk changing.
         self.call_from_thread(self._after_reindex, changed, open_status, drift)
+
+    def _index_failed(self, e: Exception) -> None:
+        self._indexing = False
+        msg = f"index error: {e}"
+        if msg != self._last_index_error:  # don't repeat it every tick
+            self._last_index_error = msg
+            self.notify(msg, severity="error")
 
     def action_reindex(self) -> None:
         self.notify("re-indexing…")
         self.reindex(full=True)
 
     def _after_reindex(self, changed: list[str], open_status: dict[str, str],
-                       drift_json: str | None = None) -> None:
+                       drift: ccformat.Drift | None = None) -> None:
+        self._indexing = False
+        self._last_index_error = None
+        if self._full_pending:
+            self._full_pending = False
+            self.reindex(full=True)
         open_changed = open_status != self._open_status
         self._open_status = open_status
-        drift = ccformat.Drift.from_json(drift_json)
+        drift = drift or ccformat.Drift()
         drift_changed = drift.to_json() != self._drift.to_json()
         self._drift = drift
         if changed:

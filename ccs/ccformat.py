@@ -7,7 +7,8 @@ types, content blocks, harness wrappers, tools). To keep ccs adaptable:
   through these helpers, so a format change is a one-file fix.
 * **Unknown things degrade gracefully** — an unknown tool still renders as
   ``Tool  <first useful arg>``, an unknown block with a ``text`` field is shown
-  as text, an unknown ``<some-tag>`` wrapper is treated as harness noise.
+  as text, an unknown ``<some-tag>…</some-tag>`` wrapper spanning the whole
+  user text is treated as harness noise.
 * **Unknown things are recorded** — ``Drift`` collects every line type / system
   subtype / block type / wrapper tag not listed below. The indexer stores it and
   ``ccs doctor`` reports it, so a Claude Code update that changes the format is
@@ -54,6 +55,8 @@ KNOWN_BLOCK_TYPES = {
 }
 
 # Leading tags Claude Code wraps harness-generated "user" text in.
+# (Unknown kebab-case tags spanning the whole text are also treated as
+# wrappers — see _is_wrapper — and reported as drift.)
 KNOWN_WRAPPER_TAGS = {
     "task-notification", "command-name", "command-message", "command-args",
     "local-command-stdout", "local-command-stderr", "local-command-caveat",
@@ -146,11 +149,21 @@ def leading_tag(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _is_wrapper_tag(tag: str) -> bool:
-    # Known wrappers, plus any hyphenated tag: Claude Code's wrappers are all
-    # kebab-case, so new ones are caught without a code change. Real prompts
-    # rarely *start* with a hyphenated tag.
-    return tag not in HUMAN_TAGS and (tag in KNOWN_WRAPPER_TAGS or "-" in tag)
+# Text made *entirely* of closed tag elements, e.g. "<a-b>…</a-b>\n<c-d>…</c-d>".
+_ALL_ELEMENTS = re.compile(r"\s*(?:<([A-Za-z][\w-]*)\b[^>]*>.*?</\1>\s*)+", re.S)
+
+
+def _is_wrapper(tag: str, text: str) -> bool:
+    """Harness wrapper? Known tags always are. An unknown kebab-case tag counts
+    only when the whole text is closed tag elements (how Claude Code wraps its
+    injected text) — so a prompt like "<my-button> doesn't render" stays a
+    prompt, while a brand-new harness wrapper is still caught (and recorded as
+    drift by ``Drift.observe``)."""
+    if tag in HUMAN_TAGS:
+        return False
+    if tag in KNOWN_WRAPPER_TAGS:
+        return True
+    return "-" in tag and bool(_ALL_ELEMENTS.fullmatch(text))
 
 
 def classify_user(obj: dict) -> UserEntry:
@@ -176,7 +189,7 @@ def classify_user(obj: dict) -> UserEntry:
     tag = leading_tag(text) if text else None
     if obj.get("isMeta"):
         return UserEntry("meta", text, images, tag)
-    if tag and _is_wrapper_tag(tag):
+    if tag and _is_wrapper(tag, text):
         if tag in ("command-name", "command-message", "command-args"):
             name = _tag_inner(text, "command-name") or ""
             if not name:
@@ -329,8 +342,21 @@ class Drift:
     def newer_than_verified(self) -> bool:
         return version_key(self.max_version) > version_key(VERIFIED_CC_VERSION)
 
-    def to_json(self) -> str:
-        return json.dumps(self.__dict__)
+    def prune_known(self) -> None:
+        """Drop names that are known now (KNOWN_* updated since parsing)."""
+        known = {"line_types": KNOWN_LINE_TYPES, "block_types": KNOWN_BLOCK_TYPES,
+                 "wrapper_tags": KNOWN_WRAPPER_TAGS | HUMAN_TAGS,
+                 "system_subtypes": {str(k) for k in KNOWN_SYSTEM_SUBTYPES}}
+        for name, ks in known.items():
+            bucket = getattr(self, name)
+            for k in [k for k in bucket if k in ks]:
+                del bucket[k]
+
+    def to_json(self, counts_only: bool = False) -> str:
+        d = dict(self.__dict__)
+        if counts_only:
+            d.pop("max_version", None)  # stored in the cc_version column
+        return json.dumps(d)
 
     @classmethod
     def from_json(cls, s: Optional[str]) -> "Drift":
