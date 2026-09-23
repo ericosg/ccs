@@ -37,12 +37,22 @@ It is **read-only** over your transcripts — it never edits or deletes a sessio
 - **Open-session indicator** — a coloured dot shows which sessions are open in a
   running Claude Code process *right now*: 🟢 busy (working) · 🟡 waiting for you
   · ⚪ idle.
-- **Inline preview** of the conversation so you can confirm a session before resuming.
+- **Readable preview** — a chat-style view of the conversation: a header card
+  (title, where, when, how long, model, PRs, Claude's recap of the session),
+  your prompts, Claude's replies rendered as Markdown, tool calls as compact
+  one-liners (`⏺ Bash  git status`, failures in red), and slash commands /
+  background-task notices as quiet markers instead of raw XML.
+- **Good titles** — uses your `/rename` title, else Claude Code's own
+  auto-generated title, else the first prompt.
 - **Resume** any session with `⏎` — launches `claude --resume` in its original cwd.
 - **Conversation-branch lineage** — forked chats show `⑂ <parent title>` so you
   can see what a session was branched from.
 - **Fast** — everything reads from a local SQLite index, so it stays snappy at
   thousands of sessions.
+- **Keeps up with Claude Code** — the transcript format is undocumented and
+  changes often; ccs flags anything it doesn't recognise (status-bar warning +
+  `ccs doctor`) instead of silently miscounting, and re-parses everything
+  automatically when its parser is updated.
 
 ## Requirements
 
@@ -82,6 +92,7 @@ ccs index               # (re)index only changed sessions, then exit
 ccs index --rebuild     # reparse every session from scratch
 ccs search "the session where I set up the CI pipeline"   # AI search from the shell
 ccs stats               # session/message counts + top projects
+ccs doctor              # check compatibility with your Claude Code version
 ```
 
 ### Keys
@@ -89,13 +100,14 @@ ccs stats               # session/message counts + top projects
 | key | action |
 |-----|--------|
 | `↑` / `↓` | move (preview follows the selection) |
-| `Enter` / `r` | **resume** the selected session (`claude --resume` in its original cwd) |
-| `/` | live fuzzy filter (title / project / branch / prompts) |
-| `f` | full-text search across all message bodies |
+| `Enter` / `r` | **resume** the selected session (`claude --resume` in its original cwd); asks for a second Enter if it's already open elsewhere |
+| `/` | live fuzzy filter (title / project / branch / prompts; words AND-ed) |
+| `f` | full-text search across all message bodies (all words first, else any) |
 | `a` | AI search — describe the session; Claude ranks the matches |
 | `Esc` | clear the current search |
 | `p` | toggle the preview pane (hiding it widens the list) |
-| `s` | cycle sort (recent / turns / duration / tokens) |
+| `[` / `]` | page the preview up / down |
+| `s` | cycle sort (recent / turns / duration / tokens) — also within groups |
 | `g` | cycle grouping (flat / project / day) |
 | `R` | force a full re-index |
 | `q` | quit |
@@ -103,10 +115,13 @@ ccs stats               # session/message counts + top projects
 ## How search works
 
 - **Fuzzy** (`/`) and **full-text** (`f`) hit the local SQLite index instantly.
+  Full-text works in any language (Greek, accented, CJK…), prefers sessions
+  containing *all* your words, and falls back to *any* of them.
 - **AI** (`a`, or `ccs search`) is two-stage so it stays fast and cheap: a
   full-text prefilter narrows your sessions to a few dozen candidates, then a
   single `claude -p` call (Haiku by default) ranks *those* against your
-  description. It never stuffs your whole transcript corpus into a prompt.
+  description. It never stuffs your whole transcript corpus into a prompt, and
+  the ranking call isn't saved as a session of its own.
 
 ## The open-session dot
 
@@ -129,15 +144,22 @@ Claude Code versions without that registry, it falls back to matching running
   If you don't want any session text leaving your machine, use `/` and `f`
   instead — those are 100% local.
 
+## When Claude Code updates
+
+If the status bar shows **⚠ Claude Code format changed**, run `ccs doctor`. It
+lists every transcript element ccs doesn't understand yet (with an example
+file), and checks the `claude` CLI flags and live-session registry ccs relies on.
+Everything format-specific lives in `ccs/ccformat.py` — see
+[CLAUDE.md](CLAUDE.md#adapting-to-claude-code-changes-read-this-first-when-something-looks-off).
+
 ## Development
 
 The architecture, data-model notes, and the non-obvious gotchas are documented
 for contributors (and for Claude Code itself) in **[CLAUDE.md](CLAUDE.md)**.
 
-There's a headless smoke test that drives the app via Textual's test pilot:
-
 ```sh
-PYTHONPATH=. .venv/bin/python tests/pilot_test.py
+PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -v   # unit tests (synthetic fixture)
+PYTHONPATH=. .venv/bin/python tests/pilot_test.py                # headless TUI smoke test (your data)
 ```
 
 ## License

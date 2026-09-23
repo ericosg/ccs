@@ -14,7 +14,7 @@ DEFAULT_PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
 DEFAULT_DB_PATH = Path(os.path.expanduser("~/.claude/ccs.db"))
 
 # Bump on any schema change → connect() auto-drops & rebuilds the cache.
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -33,7 +33,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     git_branches  TEXT,               -- comma-separated distinct branches
     branch        TEXT,               -- current/last-seen git branch
     forked_from   TEXT,               -- parent session id (conversation branch)
-    custom_title  TEXT,
+    custom_title  TEXT,               -- user-set title (/rename)
+    ai_title      TEXT,               -- Claude Code's auto-generated title
+    agent_name    TEXT,               -- session name (agent-name line)
+    recap         TEXT,               -- latest away_summary recap
+    cc_version    TEXT,               -- newest Claude Code version seen
     first_prompt  TEXT,
     last_prompt   TEXT,
     entrypoint    TEXT,
@@ -60,13 +64,14 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 SESSION_COLUMNS = [
     "id", "file_path", "project_dir", "cwd", "project", "first_ts", "last_ts",
     "duration_s", "turns", "assistant_turns", "tool_calls", "models",
-    "git_branches", "branch", "forked_from", "custom_title", "first_prompt",
-    "last_prompt",
+    "git_branches", "branch", "forked_from", "custom_title", "ai_title",
+    "agent_name", "recap", "cc_version", "first_prompt", "last_prompt",
     "entrypoint", "pr_links", "out_tokens", "size", "mtime",
 ]
 
 
 def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -80,9 +85,10 @@ def connect(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     ).fetchone():
         row = conn.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
         ver = row[0] if row else None
-    if ver != SCHEMA_VERSION:
-        for t in ("sessions", "messages_fts", "meta"):
-            conn.execute(f"DROP TABLE IF EXISTS {t}")
+    if ver == SCHEMA_VERSION:
+        return conn  # hot path (every live tick): no writes
+    for t in ("sessions", "messages_fts", "meta"):
+        conn.execute(f"DROP TABLE IF EXISTS {t}")
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_version', ?)",

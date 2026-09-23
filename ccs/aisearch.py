@@ -12,18 +12,10 @@ import re
 import subprocess
 from dataclasses import dataclass
 
+from . import search, util
+
 # Haiku is more than capable of ranking short digests and keeps latency/cost low.
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-
-_STOPWORDS = {
-    "the", "and", "for", "that", "this", "with", "from", "have", "was", "were",
-    "our", "out", "you", "your", "are", "did", "made", "make", "want", "need",
-    "where", "when", "what", "which", "how", "some", "into", "about", "can",
-    "will", "would", "there", "then", "them", "they", "used", "use", "get",
-    "got", "has", "had", "not", "but", "all", "any", "one", "way", "set",
-}
-
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 class AISearchError(RuntimeError):
@@ -41,13 +33,7 @@ class AIMatch:
 
 
 def _query_tokens(query: str) -> list[str]:
-    toks = []
-    for m in _TOKEN_RE.findall(query.lower()):
-        if len(m) < 3 or m in _STOPWORDS:
-            continue
-        if m not in toks:
-            toks.append(m)
-    return toks
+    return search.tokens(query, min_len=3) or search.tokens(query)
 
 
 def fts_candidates(conn, query: str, limit: int = 40) -> list[dict]:
@@ -55,7 +41,7 @@ def fts_candidates(conn, query: str, limit: int = 40) -> list[dict]:
     tokens = _query_tokens(query)
     rows_by_session: dict[str, dict] = {}
     if tokens:
-        match = " OR ".join(f'"{t}"' for t in tokens)
+        match = search.match_expr(tokens)
         try:
             cur = conn.execute(
                 """
@@ -106,7 +92,8 @@ def fts_candidates(conn, query: str, limit: int = 40) -> list[dict]:
                 "id": sid,
                 "project": m["project"],
                 "last_ts": m["last_ts"],
-                "title": m["custom_title"],
+                "title": util.display_title(dict(m)),
+                "recap": m["recap"],
                 "first_prompt": m["first_prompt"],
                 "last_prompt": m["last_prompt"],
                 "snip": rows_by_session[sid]["snip"],
@@ -119,11 +106,13 @@ def _build_digest(candidates: list[dict]) -> str:
     lines = []
     for c in candidates:
         date = (c["last_ts"] or "")[:10]
-        title = c["title"] or (c["first_prompt"] or "")[:70]
+        title = c["title"]
         parts = [f"id={c['id']}", f"project={c['project']}", f"date={date}"]
         lines.append("- " + " | ".join(parts))
         if title:
             lines.append(f"    title/first: {title[:120]}")
+        if c.get("recap"):
+            lines.append(f"    recap: {c['recap'][:160]}")
         if c["last_prompt"]:
             lines.append(f"    last: {c['last_prompt'][:120]}")
         if c["snip"]:
@@ -151,6 +140,14 @@ matches (score >= 40). If nothing matches, return [].
 
 
 def _extract_json_array(text: str):
+    text = (text or "").strip()
+    try:
+        v = json.loads(text)
+        if isinstance(v, list):
+            return v
+    except json.JSONDecodeError:
+        pass
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1 or end < start:
@@ -176,7 +173,10 @@ def ai_search(
     prompt = _PROMPT_TEMPLATE.format(query=query, digest=_build_digest(candidates))
     try:
         r = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json", "--model", model],
+            # --no-session-persistence: otherwise every search leaves a new
+            # junk session behind that then shows up in the list.
+            ["claude", "-p", prompt, "--output-format", "json", "--model", model,
+             "--no-session-persistence"],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -203,14 +203,18 @@ def ai_search(
         if not isinstance(item, dict) or "id" not in item:
             continue
         c = by_id.get(item["id"], {})
+        try:
+            score = int(float(item.get("score", 0)))
+        except (TypeError, ValueError):
+            score = 0
         matches.append(
             AIMatch(
-                id=item["id"],
-                score=int(item.get("score", 0)),
+                id=str(item["id"]),
+                score=score,
                 reason=str(item.get("reason", "")),
                 project=c.get("project"),
                 last_ts=c.get("last_ts"),
-                title=c.get("title") or (c.get("first_prompt") or "")[:70],
+                title=c.get("title"),
             )
         )
     matches.sort(key=lambda m: m.score, reverse=True)

@@ -1,5 +1,7 @@
 import asyncio
+import json
 import sys
+from unittest import mock
 
 from ccs.tui import CCSApp
 
@@ -18,6 +20,7 @@ async def main():
         pv = app.query_one("#preview")
         print(f"preview lines: {len(pv.lines)}  (id={app._preview_id})")
         assert len(pv.lines) > 0, "preview empty"
+        assert pv.virtual_size.width <= pv.size.width + 1, "preview wider than its pane"
 
         # fuzzy filter (any common substring; just needs to narrow the list)
         await pilot.press("slash")
@@ -52,6 +55,28 @@ async def main():
         await pilot.press("enter")
         await pilot.pause(0.3)
         print(f"full-text 'error' rows: {table.row_count}  mode={app.mode}")
+
+        # AI search runs in a worker thread (own sqlite conn); claude is mocked.
+        await pilot.press("escape")
+        some_id = next(iter(app._by_id))
+        env = {"result": json.dumps([{"id": some_id, "score": 90, "reason": "mock"}]),
+               "is_error": False}
+        fake = mock.Mock(returncode=0, stdout=json.dumps(env), stderr="")
+        with mock.patch("ccs.aisearch.subprocess.run", return_value=fake):
+            await pilot.press("a")
+            for ch in "anything":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause(0.2)
+        print(f"AI rows: {table.row_count}  mode={app.mode}")
+        assert app.mode == "ai" and table.row_count == 1, "AI search path broken"
+
+        # opening a search prompt without submitting must not blank the list
+        await pilot.press("escape")
+        await pilot.press("f")
+        await pilot.pause(0.1)
+        assert app.mode == "browse" and table.row_count >= 1
 
         # toggle preview off/on
         await pilot.press("escape")
