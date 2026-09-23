@@ -5,6 +5,8 @@ the version lives in both `pyproject.toml` and `ccs/__init__.py`.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-23
+
 ### Added
 - **Readable preview**: header card (title, cwd/branch, local time span and
   duration, prompts/replies/tokens, model, PR links, fork parent, Claude
