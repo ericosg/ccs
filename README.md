@@ -13,16 +13,19 @@ original working directory.
 It is **read-only** over your transcripts — it never edits or deletes a session.
 
 ```
-┌ ccs · 312 sessions ──────────────────────────────────────────────┬ preview ─────────────┐
-│ project     title                              branch      when turns │ ▸ you · 2h        │
-│●app         fix the checkout race condition on…             2h   41   │   the checkout... │
-│●api         why is the /orders endpoint 500ing…  ⑂ orders-…  3h   28   │ ▸ claude · o4.8   │
-│ web         landing page hero + mobile layout               1d   63   │   Looking at the  │
-│ docs        rewrite the getting-started guide               2d   12   │   handler, the... │
-│ app         add retry/backoff to the sync worker            3d   50   │                   │
-│ …                                                                     │                   │
-└───────────────────────────────────────────────────────────────────┴───────────────────────┘
- / filter   f full-text   a AI search   ⏎ resume   p preview   s sort   g group   q quit
+┌ ccs — Claude Code sessions ─────────────────────────────┬──────────────────────────────────┐
+│ project   title                        branch  when turns│ Fix checkout race condition      │
+│●app       Fix checkout race condition           2h   41 │ ~/code/app  ⎇ main               │
+│●api       Debug /orders 500 errors     ⑂ orde…  3h   28 │ when  Tue 23 Sep 09:12–11:40     │
+│ web       Landing page hero + mobile            1d   63 │ ─────────────────────────────────│
+│ docs      Rewrite getting-started guide         2d   12 │ You  09:12                       │
+│ app       Add retry/backoff to sync worker      3d   50 │   the checkout double-charges…   │
+│ …                                                      │ Claude  09:12 · opus5.5          │
+│                                                        │   ## Cause                       │
+│                                                        │   ⏺ Read  src/checkout.ts        │
+│                                                        │   ⏺ Bash  npm test   # run tests │
+└────────────────────────────────────────────────────────┴──────────────────────────────────┘
+ / filter  f full-text  a AI search  ⏎ resume  p preview  [ ] page  s sort  g group  q quit
 ```
 
 ## Features

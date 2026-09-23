@@ -181,6 +181,7 @@ ccs/
   util.py       local-time rel_time/clock/day_bucket, fmt_*, short_model, display_title.
   tui.py        the Textual App (CCSApp).
   __main__.py   argparse CLI (tui / index / search / stats / doctor); entry = main().
+CHANGELOG.md    Keep a changelog-style history; add to *Unreleased* with every change.
 launch.sh       venv launcher (symlink-resolving), symlinkable to ~/.local/bin/ccs.
 tests/test_ccs.py     unittest suite on a synthetic transcript fixture.
 tests/pilot_test.py   headless Textual pilot smoke test (real ~/.claude data).
@@ -396,6 +397,18 @@ It asserts `>=` on row counts, never `==`, because the live re-index can add
 sessions mid-test. It also runs the in-TUI AI search through its real worker
 thread with `claude` mocked, and checks the preview isn't wider than its pane.
 The actual resume (`claude --resume` in a suspended terminal) isn't covered.
+
+## Releasing
+
+1. `PYTHONPATH=. .venv/bin/python -m unittest discover -s tests` and
+   `tests/pilot_test.py` pass; `ccs doctor` says "all good" (update
+   `ccformat.VERIFIED_CC_VERSION` to the Claude Code version you checked).
+2. Bump the version in **both** `pyproject.toml` and `ccs/__init__.py`.
+3. Move `CHANGELOG.md`'s *Unreleased* section under the new version + date.
+4. Commit, `git tag vX.Y.Z`, push `main` and the tag; optionally
+   `gh release create vX.Y.Z --notes-file <section>`.
+   Users install from git (`pipx install git+https://github.com/ericosg/ccs`),
+   so the tag/push *is* the release.
 
 ## Roadmap / deliberately deferred
 
